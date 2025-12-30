@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>webmacs</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 40px 20px;
+      }
+
+      .terminal-window {
+        width: 100%;
+        max-width: 1000px;
+        background: #1e1e1e;
+        border-radius: 12px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        overflow: hidden;
+      }
+
+      .title-bar {
+        background: #2d2d2d;
+        padding: 12px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-bottom: 1px solid #1a1a1a;
+      }
+
+      .traffic-lights {
+        display: flex;
+        gap: 8px;
+      }
+
+      .light {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+      }
+
+      .light.red {
+        background: #ff5f56;
+      }
+
+      .light.yellow {
+        background: #ffbd2e;
+      }
+
+      .light.green {
+        background: #27c93f;
+      }
+
+      .title {
+        color: #e5e5e5;
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0.3px;
+      }
+
+      .connection-status {
+        margin-left: auto;
+        font-size: 11px;
+        color: #888;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .connection-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #888;
+      }
+
+      .connection-dot.connected {
+        background: #27c93f;
+      }
+
+      .connection-dot.disconnected {
+        background: #ff5f56;
+      }
+
+      .connection-dot.connecting {
+        background: #ffbd2e;
+        animation: pulse 1s infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+      }
+
+      #terminal-container {
+        height: 600px;
+        padding: 16px;
+        background: #1e1e1e;
+        position: relative;
+        overflow: hidden;
+      }
+
+      #terminal-container canvas {
+        display: block;
+      }
+
+      @media (max-width: 768px) {
+        body {
+          padding: 20px 10px;
+        }
+
+        #terminal-container {
+          height: 500px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="terminal-window">
+      <div class="title-bar">
+        <div class="traffic-lights">
+          <span class="light red"></span>
+          <span class="light yellow"></span>
+          <span class="light green"></span>
+        </div>
+        <div class="title">webmacs</div>
+        <div class="connection-status">
+          <span class="connection-dot connecting" id="connection-dot"></span>
+          <span id="connection-text">Connecting...</span>
+        </div>
+      </div>
+      <div id="terminal-container"></div>
+    </div>
+
+    <script type="module">
+      // Import ghostty-web from dist
+      import { init, Terminal } from '/dist/ghostty-web.js';
+
+      let term;
+      let ws;
+
+      async function initTerminal() {
+        // Initialize WASM
+        await init();
+
+        term = new Terminal({
+          cursorBlink: true,
+          fontSize: 14,
+          fontFamily: 'Monaco, Menlo, "Courier New", monospace',
+          theme: {
+            background: '#1e1e1e',
+            foreground: '#d4d4d4',
+          },
+          scrollback: 10000,
+        });
+
+        const container = document.getElementById('terminal-container');
+        await term.open(container);
+
+        // Handle window resize
+        function fitTerminal() {
+          const rect = container.getBoundingClientRect();
+          term.resize(Math.floor((rect.width - 32) / term.options.fontSize * 2), Math.floor((rect.height - 32) / (term.options.fontSize * 1.8)));
+        }
+
+        window.addEventListener('resize', fitTerminal);
+        setTimeout(fitTerminal, 100); // Initial fit
+
+        // Handle terminal resize
+        term.onResize((size) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows }));
+          }
+        });
+
+        // Handle user input
+        term.onData((data) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+          }
+        });
+
+        // Connect to PTY server
+        connectWebSocket();
+      }
+
+      function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const cols = term.cols || 80;
+        const rows = term.rows || 24;
+        const wsUrl = `${protocol}//${window.location.host}/ws?cols=${cols}&rows=${rows}`;
+
+        updateConnectionStatus('connecting', 'Connecting...');
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          updateConnectionStatus('connected', 'Connected');
+        };
+
+        ws.onmessage = (event) => {
+          term.write(event.data);
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          updateConnectionStatus('disconnected', 'Error');
+        };
+
+        ws.onclose = () => {
+          updateConnectionStatus('disconnected', 'Disconnected');
+          term.write('\r\n\x1b[31mConnection closed. Reconnecting in 3s...\x1b[0m\r\n');
+          setTimeout(() => {
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+              connectWebSocket();
+            }
+          }, 3000);
+        };
+      }
+
+      function updateConnectionStatus(status, text) {
+        const dot = document.getElementById('connection-dot');
+        const statusText = document.getElementById('connection-text');
+
+        dot.className = 'connection-dot ' + status;
+        statusText.textContent = text;
+      }
+
+      // Handle mobile keyboard showing/hiding
+      if (window.visualViewport) {
+        const terminalContainer = document.getElementById('terminal-container');
+        const terminalWindow = document.querySelector('.terminal-window');
+        const originalHeight = terminalContainer.style.height;
+        const body = document.body;
+
+        window.visualViewport.addEventListener('resize', () => {
+          const keyboardHeight = window.innerHeight - window.visualViewport.height;
+          if (keyboardHeight > 100) {
+            body.style.padding = '0';
+            body.style.alignItems = 'flex-start';
+            terminalWindow.style.borderRadius = '0';
+            terminalWindow.style.maxWidth = '100%';
+            terminalContainer.style.height = (window.visualViewport.height - 60) + 'px';
+            window.scrollTo(0, 0);
+          } else {
+            body.style.padding = '40px 20px';
+            body.style.alignItems = 'center';
+            terminalWindow.style.borderRadius = '12px';
+            terminalWindow.style.maxWidth = '1000px';
+            terminalContainer.style.height = originalHeight || '600px';
+          }
+        });
+      }
+
+      // Initialize on load
+      initTerminal();
+    </script>
+  </body>
+</html>
