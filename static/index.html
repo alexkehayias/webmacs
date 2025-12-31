@@ -168,14 +168,33 @@
         const container = document.getElementById('terminal-container');
         await term.open(container);
 
+        // Calculate terminal dimensions
+        function calculateDimensions() {
+          const rect = container.getBoundingClientRect();
+          const canvas = container.querySelector('canvas');
+          if (canvas) {
+            // Measure actual character cell dimensions
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              const metrics = ctx.measureText('M');
+              // Use actual measured width and estimate height from font size
+              const cellWidth = metrics.width;
+              const cellHeight = Math.ceil(term.options.fontSize * 1.1); // Typical line-height for monospace
+              const cols = Math.floor((rect.width - 32) / cellWidth);
+              const rows = Math.floor((rect.height - 32) / cellHeight);
+              return { cols, rows };
+            }
+          }
+          return { cols: 80, rows: 24 };
+        }
+
         // Handle window resize
         function fitTerminal() {
-          const rect = container.getBoundingClientRect();
-          term.resize(Math.floor((rect.width - 32) / term.options.fontSize * 2), Math.floor((rect.height - 32) / (term.options.fontSize * 1.8)));
+          const { cols, rows } = calculateDimensions();
+          term.resize(cols, rows);
         }
 
         window.addEventListener('resize', fitTerminal);
-        setTimeout(fitTerminal, 100); // Initial fit
 
         // Handle terminal resize
         term.onResize((size) => {
@@ -191,14 +210,14 @@
           }
         });
 
-        // Connect to PTY server
-        connectWebSocket();
+        // Calculate initial dimensions and connect
+        const { cols: initCols, rows: initRows } = calculateDimensions();
+        term.resize(initCols, initRows);
+        connectWebSocket(initCols, initRows);
       }
 
-      function connectWebSocket() {
+      function connectWebSocket(cols, rows) {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const cols = term.cols || 80;
-        const rows = term.rows || 24;
         const wsUrl = `${protocol}//${window.location.host}/ws?cols=${cols}&rows=${rows}`;
 
         updateConnectionStatus('connecting', 'Connecting...');
@@ -223,7 +242,7 @@
           term.write('\r\n\x1b[31mConnection closed. Reconnecting in 3s...\x1b[0m\r\n');
           setTimeout(() => {
             if (!ws || ws.readyState === WebSocket.CLOSED) {
-              connectWebSocket();
+              connectWebSocket(term.cols, term.rows);
             }
           }, 3000);
         };
