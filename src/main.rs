@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ws::WebSocket, ws::Message, Query, WebSocketUpgrade},
+    extract::{ws::WebSocket, ws::Message, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -8,24 +8,42 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{
     native_pty_system,
-    CommandBuilder, PtySize,
+    Child, CommandBuilder, MasterPty, PtySize,
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env,
     io::{self, Read, Write},
     net::SocketAddr,
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
+use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// WebSocket connection query parameters
 #[derive(Debug, Deserialize)]
 struct WsParams {
     cols: Option<u16>,
     rows: Option<u16>,
+    session_id: Option<String>,
 }
+
+/// PTY session state - stores only what's needed to keep the process alive
+struct PtySession {
+    _child: Box<dyn Child + Send>,
+    master: Box<dyn MasterPty + Send>,
+    write_tx: mpsc::Sender<Vec<u8>>,
+}
+
+unsafe impl Send for PtySession {}
+unsafe impl Sync for PtySession {}
+
+/// Session pool state
+type SessionPool = Arc<Mutex<HashMap<String, PtySession>>>;
 
 /// Resize message from client
 #[derive(Debug, Deserialize)]
@@ -58,7 +76,7 @@ fn get_shell_command() -> CommandBuilder {
 }
 
 /// Create a new PTY session
-fn create_pty(cols: u16, rows: u16) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+fn create_pty(cols: u16, rows: u16) -> io::Result<(PtySession, Box<dyn Read + Send>)> {
     let pty_system = native_pty_system();
 
     let pty_size = PtySize {
@@ -74,84 +92,159 @@ fn create_pty(cols: u16, rows: u16) -> io::Result<(Box<dyn Read + Send>, Box<dyn
         io::Error::new(io::ErrorKind::Other, e)
     })?;
 
-    // Spawn the command
-    let _child = pair.slave.spawn_command(shell_cmd).map_err(|e| {
+    // Spawn the command and keep the child handle
+    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| {
         io::Error::new(io::ErrorKind::Other, e)
     })?;
 
     let reader = pair.master.try_clone_reader().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, e)
     })?;
-    let writer = pair.master.take_writer().map_err(|e| {
+    let mut writer = pair.master.take_writer().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, e)
     })?;
 
-    Ok((reader, writer))
+    // Create a channel for writes
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(100);
+
+    // Spawn a background task to forward writes from channel to PTY
+    tokio::spawn(async move {
+        while let Some(data) = write_rx.recv().await {
+            if writer.write_all(&data).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    let session = PtySession {
+        _child: child,
+        master: pair.master,
+        write_tx,
+    };
+
+    Ok((session, reader))
 }
 
 /// WebSocket upgrade handler
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsParams>,
+    State(sessions): State<SessionPool>,
 ) -> Response {
     info!("WebSocket connection requested with cols={:?}, rows={:?}", params.cols, params.rows);
 
-    ws.on_upgrade(|socket| handle_socket(socket, params))
+    ws.on_upgrade(|socket| handle_socket(socket, params, sessions))
 }
 
 /// Handle WebSocket connection
-async fn handle_socket(mut socket: WebSocket, params: WsParams) {
+async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: SessionPool) {
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
 
-    // Create PTY
-    let (mut pty_reader, mut pty_writer) = match create_pty(cols, rows) {
-        Ok((r, w)) => (r, w),
-        Err(e) => {
-            error!("Failed to create PTY: {}", e);
-            let _ = socket.send(Message::Text(format!("\r\n\x1b[31mFailed to create PTY: {}\x1b[0m\r\n", e).into())).await;
-            return;
+    // Determine session ID
+    let session_id = match params.session_id {
+        Some(id) => id,
+        None => Uuid::new_v4().to_string(),
+    };
+
+    // Try to get existing session or create new one
+    let (is_new_session, pty_reader, write_tx): (bool, Box<dyn Read + Send>, mpsc::Sender<Vec<u8>>) = {
+        let mut sessions_guard = sessions.lock().unwrap();
+        let is_new_session = !sessions_guard.contains_key(&session_id);
+
+        if is_new_session {
+            // Create new PTY session
+            match create_pty(cols, rows) {
+                Ok((session, reader)) => {
+                    info!("Created new PTY session: {}", session_id);
+                    let write_tx = session.write_tx.clone();
+                    sessions_guard.insert(session_id.clone(), session);
+                    (true, reader, write_tx)
+                }
+                Err(e) => {
+                    error!("Failed to create PTY: {}", e);
+                    // Return early with a placeholder that will cause us to exit
+                    return;
+                }
+            }
+        } else {
+            // Reuse existing session
+            info!("Reusing existing PTY session: {}", session_id);
+            let session = sessions_guard.get(&session_id).unwrap();
+            // Clone the reader from existing session
+            match session.master.try_clone_reader() {
+                Ok(reader) => {
+                    let write_tx = session.write_tx.clone();
+                    (false, reader, write_tx)
+                }
+                Err(_) => {
+                    error!("Failed to clone PTY reader for session {}", session_id);
+                    return;
+                }
+            }
         }
     };
 
-    info!("PTY session created");
+    let mut pty_reader = pty_reader;
 
-    // Send welcome message
-    let welcome = format!(
-        "{}\r\n{}  {}Welcome to webmacs!{}\r\n{}\r\n",
-        "\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m",
-        "\x1b[1;36m║\x1b[0m",
-        "\x1b[1;32m",
-        "\x1b[0m",
-        "\x1b[1;36m║\x1b[0m                                                              \x1b[1;36m║\x1b[0m",
-    );
-    let welcome2 = format!(
-        "{}  {}You have a real shell session with full PTY support.{}\r\n",
-        "\x1b[1;36m║\x1b[0m  ",
-        "",
-        "\x1b[0m",
-    );
-    let welcome3 = format!(
-        "{}  Try: ls, cd, top, emacs, or any command!                   {}\r\n",
-        "\x1b[1;36m║\x1b[0m  ",
-        "\x1b[1;36m║\x1b[0m",
-    );
-    let welcome4 = format!(
-        "{}\r\n\r\n",
-        "\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m",
-    );
+    // Send welcome message (only for new sessions)
+    if is_new_session {
+        let welcome = format!(
+            "{}\r\n{}  {}Welcome to webmacs!{}\r\n{}\r\n",
+            "\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m",
+            "\x1b[1;36m║\x1b[0m",
+            "\x1b[1;32m",
+            "\x1b[0m",
+            "\x1b[1;36m║\x1b[0m                                                              \x1b[1;36m║\x1b[0m",
+        );
+        let welcome2 = format!(
+            "{}  {}You have a real shell session with full PTY support.{}\r\n",
+            "\x1b[1;36m║\x1b[0m  ",
+            "",
+            "\x1b[0m",
+        );
+        let welcome3 = format!(
+            "{}  Session ID: {}{}{}\r\n",
+            "\x1b[1;36m║\x1b[0m  ",
+            "\x1b[1;33m",
+            session_id,
+            "\x1b[0m",
+        );
+        let welcome4 = format!(
+            "{}  Try: ls, cd, top, emacs, or any command!                   {}\r\n",
+            "\x1b[1;36m║\x1b[0m  ",
+            "\x1b[1;36m║\x1b[0m",
+        );
+        let welcome5 = format!(
+            "{}\r\n\r\n",
+            "\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m",
+        );
 
-    if socket.send(Message::Text(welcome.into())).await.is_err() {
-        return;
-    }
-    if socket.send(Message::Text(welcome2.into())).await.is_err() {
-        return;
-    }
-    if socket.send(Message::Text(welcome3.into())).await.is_err() {
-        return;
-    }
-    if socket.send(Message::Text(welcome4.into())).await.is_err() {
-        return;
+        if socket.send(Message::Text(welcome.into())).await.is_err() {
+            return;
+        }
+        if socket.send(Message::Text(welcome2.into())).await.is_err() {
+            return;
+        }
+        if socket.send(Message::Text(welcome3.into())).await.is_err() {
+            return;
+        }
+        if socket.send(Message::Text(welcome4.into())).await.is_err() {
+            return;
+        }
+        if socket.send(Message::Text(welcome5.into())).await.is_err() {
+            return;
+        }
+    } else {
+        // Reconnection message
+        let reconnect = format!(
+            "\r\n\x1b[1;32mReconnected to session: {}\x1b[0m\r\n",
+            session_id
+        );
+        if socket.send(Message::Text(reconnect.into())).await.is_err() {
+            return;
+        }
     }
 
     // Create channels for bidirectional communication
@@ -196,17 +289,15 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams) {
                         }
                     }
 
-                    // Send to PTY
-                    if pty_writer.write_all(text.as_bytes()).is_err() {
+                    // Send to PTY via channel
+                    if write_tx.send(text.bytes().collect::<Vec<u8>>()).await.is_err() {
                         break;
                     }
-                    let _ = pty_writer.flush();
                 }
                 Ok(Message::Binary(data)) => {
-                    if pty_writer.write_all(&data).is_err() {
+                    if write_tx.send(data.to_vec()).await.is_err() {
                         break;
                     }
-                    let _ = pty_writer.flush();
                 }
                 Ok(Message::Close(_)) => {
                     info!("WebSocket close received");
@@ -273,6 +364,22 @@ async fn main() -> io::Result<()> {
         );
     }
 
+    // Create session pool
+    let sessions: SessionPool = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn session cleanup task
+    let sessions_cleanup = sessions.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Check every 5 minutes
+        loop {
+            interval.tick().await;
+            let sessions = sessions_cleanup.lock().unwrap();
+            if !sessions.is_empty() {
+                info!("Session pool has {} active sessions", sessions.len());
+            }
+        }
+    });
+
     // Build the router
     let app = Router::new()
         .route("/", get(index_handler))
@@ -280,7 +387,8 @@ async fn main() -> io::Result<()> {
         .nest_service(
             "/dist",
             ServeDir::new(&ghostty_dist).fallback(ServeDir::new("..")),
-        );
+        )
+        .with_state(sessions);
 
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     info!("Starting webmacs server on http://0.0.0.0:{}", port);

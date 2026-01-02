@@ -149,6 +149,9 @@
 
       let term;
       let ws;
+      // Get or create session ID from localStorage
+      const SESSION_KEY = 'webmacs_session_id';
+      let sessionId = localStorage.getItem(SESSION_KEY);
 
       async function initTerminal() {
         // Initialize WASM
@@ -218,7 +221,9 @@
 
       function connectWebSocket(cols, rows) {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws?cols=${cols}&rows=${rows}`;
+        // Include session_id if we have one
+        const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+        const wsUrl = `${protocol}//${window.location.host}/ws?cols=${cols}&rows=${rows}${sessionParam}`;
 
         updateConnectionStatus('connecting', 'Connecting...');
 
@@ -229,6 +234,14 @@
         };
 
         ws.onmessage = (event) => {
+          // Check for session ID in welcome message
+          if (!sessionId && event.data.includes('Session ID:')) {
+            const match = event.data.match(/Session ID:\s*\x1b\[33m([^\x1b]+)/);
+            if (match && match[1]) {
+              sessionId = match[1].trim();
+              localStorage.setItem(SESSION_KEY, sessionId);
+            }
+          }
           term.write(event.data);
         };
 
