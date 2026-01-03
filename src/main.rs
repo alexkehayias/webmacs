@@ -16,12 +16,11 @@ use std::{
     env,
     io::{self, Read, Write},
     net::SocketAddr,
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 /// WebSocket connection query parameters
@@ -345,22 +344,6 @@ async fn main() -> io::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
 
-    // Ghostty-web dist directory path
-    let ghostty_dist = env::var("GHOSTTY_DIST")
-        .unwrap_or_else(|_| "../ghostty-web/dist".to_string());
-
-    info!("Using ghostty-web dist from: {}", ghostty_dist);
-
-    // Check if the directory exists
-    let dist_path = PathBuf::from(&ghostty_dist);
-    if !dist_path.exists() {
-        warn!(
-            "Ghostty-web dist directory not found at: {}. \
-             Make sure ghostty-web is built or set GHOSTTY_DIST environment variable.",
-            ghostty_dist
-        );
-    }
-
     // Create session pool
     let sessions: SessionPool = Arc::new(Mutex::new(HashMap::new()));
 
@@ -382,8 +365,8 @@ async fn main() -> io::Result<()> {
         .route("/", get(index_handler))
         .route("/ws", get(ws_handler))
         .nest_service(
-            "/dist",
-            ServeDir::new(&ghostty_dist).fallback(ServeDir::new("..")),
+            "/static",
+            ServeDir::new("static"),
         )
         .with_state(sessions);
 
