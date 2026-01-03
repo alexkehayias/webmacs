@@ -1,27 +1,25 @@
 use axum::{
     extract::{ws::WebSocket, ws::Message, Query, State, WebSocketUpgrade},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Html},
     routing::get,
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use include_dir::{include_dir, Dir};
 use portable_pty::{
     native_pty_system,
     Child, CommandBuilder, MasterPty, PtySize,
 };
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
-    env,
-    io::{self, Read, Write},
-    net::SocketAddr,
-    sync::{Arc, Mutex},
+    collections::HashMap, env, io::{self, Read, Write}, net::SocketAddr, sync::{Arc, Mutex}
 };
 use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tracing::{error, info};
 use uuid::Uuid;
+
+const STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
 /// WebSocket connection query parameters
 #[derive(Debug, Deserialize)]
@@ -275,15 +273,13 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
             match result {
                 Ok(Message::Text(text)) => {
                     // Check for resize message
-                    if text.starts_with('{') {
-                        if let Ok(msg) = serde_json::from_str::<ResizeMessage>(&text) {
-                            if msg.msg_type == "resize" {
+                    if text.starts_with('{')
+                        && let Ok(msg) = serde_json::from_str::<ResizeMessage>(&text)
+                            && msg.msg_type == "resize" {
                                 info!("Received resize request: {}x{}", msg.cols, msg.rows);
                                 // Note: portable_pty doesn't support resize after creation
                                 continue;
                             }
-                        }
-                    }
 
                     // Send to PTY via channel
                     if write_tx.send(text.bytes().collect::<Vec<u8>>()).await.is_err() {
@@ -316,17 +312,9 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
 
 /// Serve the main HTML page
 async fn index_handler() -> impl IntoResponse {
-    let html = include_str!("../static/index.html");
+    let file = STATIC_DIR.get_file("index.html").unwrap();
+    let html = file.contents_utf8().unwrap();
     Html(html)
-}
-
-/// HTML response wrapper
-struct Html(&'static str);
-
-impl IntoResponse for Html {
-    fn into_response(self) -> Response {
-        (StatusCode::OK, [("content-type", "text/html")], self.0).into_response()
-    }
 }
 
 #[tokio::main]

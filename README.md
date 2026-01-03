@@ -6,6 +6,15 @@ Terminal emulator for running Emacs in the browser via WebAssembly communicating
 
 ## Quickstart
 
-1. Run `cargo run`
-2. Open http://localhost:8080 in your browser
-3. Type `emacs -nw`
+### Using Docker
+
+```
+docker build . -t webmacs:latest
+docker run --rm -p 8080:8080 webmacs:latest
+```
+
+### Using Cargo
+
+```
+cargo run
+```
