@@ -142,11 +142,8 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
 
-    // Determine session ID
-    let session_id = match params.session_id {
-        Some(id) => id,
-        None => Uuid::new_v4().to_string(),
-    };
+    // Determine session ID - frontend always provides one
+    let session_id = params.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Try to get existing session or create new one
     let (is_new_session, pty_reader, write_tx): (bool, Box<dyn Read + Send>, mpsc::Sender<Vec<u8>>) = {
