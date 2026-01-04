@@ -105,8 +105,9 @@ fn create_pty(cols: u16, rows: u16) -> io::Result<(PtySession, Box<dyn Read + Se
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(100);
 
     // Spawn a background task to forward writes from channel to PTY
-    tokio::spawn(async move {
-        while let Some(data) = write_rx.recv().await {
+    // Use spawn_blocking for blocking I/O operations
+    tokio::task::spawn_blocking(move || {
+        while let Some(data) = write_rx.blocking_recv() {
             if writer.write_all(&data).is_err() {
                 break;
             }
@@ -244,8 +245,11 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
     // Create channels for bidirectional communication
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // PTY -> WebSocket task
-    let pty_to_ws = tokio::spawn(async move {
+    // Create a channel for PTY output to WebSocket
+    let (pty_out_tx, mut pty_out_rx) = mpsc::channel::<Vec<u8>>(100);
+
+    // PTY reader task (blocking)
+    let pty_to_ws = tokio::task::spawn_blocking(move || {
         let mut buffer = [0u8; 8192];
         loop {
             match pty_reader.read(&mut buffer) {
@@ -254,8 +258,9 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
                     break;
                 }
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buffer[..n]).to_string();
-                    if ws_sender.send(Message::Text(data.into())).await.is_err() {
+                    let data = buffer[..n].to_vec();
+                    // Send to async task for WebSocket transmission
+                    if pty_out_tx.blocking_send(data).is_err() {
                         break;
                     }
                 }
@@ -263,6 +268,17 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
                     error!("PTY read error: {}", e);
                     break;
                 }
+            }
+        }
+    });
+
+    // PTY -> WebSocket forwarder (async)
+    let pty_forward = tokio::spawn(async move {
+        while let Some(data) = pty_out_rx.recv().await {
+            if ws_sender.send(Message::Text(
+                String::from_utf8_lossy(&data).to_string().into()
+            )).await.is_err() {
+                break;
             }
         }
     });
@@ -304,8 +320,8 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
         }
     });
 
-    // Wait for both tasks to complete
-    let _ = tokio::join!(pty_to_ws, ws_to_pty);
+    // Wait for all tasks to complete
+    let _ = tokio::join!(pty_to_ws, pty_forward, ws_to_pty);
 
     info!("WebSocket connection closed");
 }
@@ -341,9 +357,9 @@ async fn main() -> io::Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Check every 5 minutes
         loop {
             interval.tick().await;
-            let sessions = sessions_cleanup.lock().unwrap();
-            if !sessions.is_empty() {
-                info!("Session pool has {} active sessions", sessions.len());
+            let session_count = sessions_cleanup.lock().unwrap().len();
+            if session_count > 0 {
+                info!("Session pool has {} active sessions", session_count);
             }
         }
     });
