@@ -343,7 +343,8 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
-    let port = env::var("PORT")
+    let host = env::var("WEBMACS_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = env::var("WEBMACS_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
@@ -374,9 +375,9 @@ async fn main() -> io::Result<()> {
         )
         .with_state(sessions);
 
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-    info!("Starting webmacs server on http://0.0.0.0:{}", port);
-    info!("WebSocket endpoint: ws://0.0.0.0:{}/ws", port);
+    let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+    info!("Starting webmacs server on http://{}:{}", host, port);
+    info!("WebSocket endpoint: ws://{}:{}/ws", host, port);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
