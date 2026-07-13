@@ -12,7 +12,12 @@ use portable_pty::{
 };
 use serde::Deserialize;
 use std::{
-    collections::HashMap, env, io::{self, Read, Write}, net::SocketAddr, sync::{Arc, Mutex}
+    collections::HashMap,
+    env,
+    io::{self, Read, Write},
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
@@ -34,10 +39,32 @@ struct PtySession {
     _child: Box<dyn Child + Send>,
     master: Box<dyn MasterPty + Send>,
     write_tx: mpsc::Sender<Vec<u8>>,
+    active_connections: usize,
+    idle_since: Option<Instant>,
 }
 
 unsafe impl Send for PtySession {}
 unsafe impl Sync for PtySession {}
+
+/// RAII guard that marks a session as no longer connected when the WebSocket
+/// handler returns. Decrements `active_connections`; if that brings it to 0,
+/// records the idle time so the cleanup task can reap stale sessions. Holds
+/// nothing across await points - safe to drop from a panicking task.
+struct ConnGuard {
+    sessions: SessionPool,
+    session_id: String,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&self.session_id) {
+            session.active_connections = session.active_connections.saturating_sub(1);
+            if session.active_connections == 0 {
+                session.idle_since = Some(Instant::now());
+            }
+        }
+    }
+}
 
 /// Session pool state
 type SessionPool = Arc<Mutex<HashMap<String, PtySession>>>;
@@ -119,6 +146,8 @@ fn create_pty(cols: u16, rows: u16) -> io::Result<(PtySession, Box<dyn Read + Se
         _child: child,
         master: pair.master,
         write_tx,
+        active_connections: 0,
+        idle_since: None,
     };
 
     Ok((session, reader))
@@ -151,9 +180,12 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
         if is_new_session {
             // Create new PTY session
             match create_pty(cols, rows) {
-                Ok((session, reader)) => {
+                Ok((mut session, reader)) => {
                     info!("Created new PTY session: {}", session_id);
                     let write_tx = session.write_tx.clone();
+                    // Mark this connection as active before inserting so the
+                    // cleanup task never observes a session with count 0.
+                    session.active_connections = 1;
                     sessions_guard.insert(session_id.clone(), session);
                     (true, reader, write_tx)
                 }
@@ -166,11 +198,14 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
         } else {
             // Reuse existing session
             info!("Reusing existing PTY session: {}", session_id);
-            let session = sessions_guard.get(&session_id).unwrap();
+            let session = sessions_guard.get_mut(&session_id).unwrap();
             // Clone the reader from existing session
             match session.master.try_clone_reader() {
                 Ok(reader) => {
                     let write_tx = session.write_tx.clone();
+                    session.active_connections += 1;
+                    // Session is now active again - clear any idle marker
+                    session.idle_since = None;
                     (false, reader, write_tx)
                 }
                 Err(_) => {
@@ -179,6 +214,13 @@ async fn handle_socket(mut socket: WebSocket, params: WsParams, sessions: Sessio
                 }
             }
         }
+    };
+
+    // RAII guard: when this WebSocket disconnects (normal close, error, or
+    // panic), decrement the active-connection count and mark idle if it hits 0.
+    let _conn_guard = ConnGuard {
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
     };
 
     let mut pty_reader = pty_reader;
@@ -352,15 +394,38 @@ async fn main() -> io::Result<()> {
     // Create session pool
     let sessions: SessionPool = Arc::new(Mutex::new(HashMap::new()));
 
-    // Spawn session cleanup task
+    // Spawn session cleanup task - reaps sessions with no active connections
+    // that have been idle for more than 24 hours.
     let sessions_cleanup = sessions.clone();
     tokio::spawn(async move {
+        const MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Check every 5 minutes
         loop {
             interval.tick().await;
-            let session_count = sessions_cleanup.lock().unwrap().len();
-            if session_count > 0 {
-                info!("Session pool has {} active sessions", session_count);
+            let now = Instant::now();
+            let (removed, remaining) = {
+                let mut guard = sessions_cleanup.lock().unwrap();
+                let before = guard.len();
+                guard.retain(|id, s| {
+                    let idle_too_long = s
+                        .idle_since
+                        .is_some_and(|t| now.duration_since(t) > MAX_IDLE);
+                    if s.active_connections == 0 && idle_too_long {
+                        info!("Removing idle session {} (no connection for >24h)", id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                (before - guard.len(), guard.len())
+            };
+            if removed > 0 {
+                info!(
+                    "Cleaned up {} idle session(s), {} active",
+                    removed, remaining
+                );
+            } else if remaining > 0 {
+                info!("Session pool has {} active sessions", remaining);
             }
         }
     });
